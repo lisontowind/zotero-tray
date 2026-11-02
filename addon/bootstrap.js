@@ -14,6 +14,10 @@ var ZoteroTray = {
   readyTimer: null,
   stopPromise: null,
   resolveStop: null,
+  stopTimer: null,
+  stopTimeoutMs: 5000,
+  stopTimedOut: false,
+  nativeStopped: false,
   chromeHandle: null,
   nativeBridge: null,
   lastAppearanceKey: null,
@@ -51,6 +55,10 @@ var ZoteroTray = {
 
   async start(data) {
     if (!Zotero.isWin || this.worker) return;
+    if (Zotero.__zoteroTrayPendingCleanup?.size) {
+      this.log("Previous tray worker is still cleaning up; restart Zotero before enabling again");
+      return;
+    }
     this.startupTiming = { enteredAt: Date.now() };
     this.log("Starting tray initialization");
     this.stopping = false;
@@ -59,6 +67,8 @@ var ZoteroTray = {
     this.sessionEnding = false;
     this.ready = false;
     this.stopPromise = null;
+    this.stopTimedOut = false;
+    this.nativeStopped = false;
     this.lastAppearanceKey = null;
     try {
       // Registering a chrome URL also supports workers loaded from a packed XPI.
@@ -118,7 +128,13 @@ var ZoteroTray = {
   onMessage(message) {
     if (message.type === "stopped") {
       this.log("Native resources released");
-      this.resolveStop?.();
+      this.nativeStopped = true;
+      if (this.stopping) this.completeStop();
+      else this.fail(new Error("Tray worker stopped unexpectedly"));
+      return;
+    }
+    if (message.type === "cleanup-error") {
+      this.deferStop(new Error(message.message));
       return;
     }
     if (this.stopping) return;
@@ -237,6 +253,40 @@ var ZoteroTray = {
     this.stop().catch(error => Zotero.logError(error));
   },
 
+  deferStop(error) {
+    clearTimeout(this.stopTimer);
+    this.stopTimer = null;
+    this.stopTimedOut = true;
+    this.log(`Native cleanup deferred until acknowledgement or application exit: ${error.message}`);
+    Zotero.logError(error);
+    // Zotero removes the plugin scope on disable. Keep the controller, worker,
+    // and loaded native libraries rooted in the application until a late ACK.
+    this.resolveStop?.(false);
+    this.resolveStop = null;
+  },
+
+  completeStop() {
+    clearTimeout(this.stopTimer);
+    this.stopTimer = null;
+    const resolve = this.resolveStop;
+    this.resolveStop = null;
+    const worker = this.worker;
+    if (worker) {
+      worker.onmessage = null;
+      worker.onerror = null;
+      worker.terminate();
+    }
+    this.worker = null;
+    this.nativeBridge?.user32.close();
+    this.nativeBridge = null;
+    this.chromeHandle?.destruct();
+    this.chromeHandle = null;
+    this.stopTimedOut = false;
+    Zotero.__zoteroTrayPendingCleanup?.delete(this);
+    if (Zotero.__zoteroTrayPendingCleanup?.size === 0) delete Zotero.__zoteroTrayPendingCleanup;
+    resolve?.(true);
+  },
+
   async stop() {
     if (this.stopPromise) return this.stopPromise;
     this.stopping = true;
@@ -246,31 +296,22 @@ var ZoteroTray = {
     for (const win of [...this.windows.keys()]) this.detach(win);
     for (const [topic, observer] of this.observers) Services.obs.removeObserver(observer, topic);
     this.observers = [];
-    const worker = this.worker;
-    this.stopPromise = (async () => {
-      if (worker) {
-        // Cooperative shutdown is essential: terminating a worker with a live
-        // native WNDPROC would leave a dangling function pointer inside Windows.
-        await new Promise(resolve => {
-          this.resolveStop = resolve;
-          // The worker can be inside TrackPopupMenu's native modal loop. A
-          // posted window message breaks that loop even while JS messages wait.
-          if (this.nativeBridge?.hwnd) {
-            this.nativeBridge.post(this.nativeBridge.hwnd, 0x8002, 0, 0);
-          }
-          worker.postMessage({ type: "stop" });
-        });
-        worker.onmessage = null;
-        worker.onerror = null;
-        worker.terminate();
-      }
-      this.worker = null;
-      this.resolveStop = null;
-      this.nativeBridge?.user32.close();
-      this.nativeBridge = null;
-      this.chromeHandle?.destruct();
-      this.chromeHandle = null;
-    })();
+    this.stopPromise = new Promise(resolve => { this.resolveStop = resolve; });
+    if (!this.worker || this.nativeStopped) {
+      this.completeStop();
+      return this.stopPromise;
+    }
+    (Zotero.__zoteroTrayPendingCleanup ||= new Set()).add(this);
+    this.stopTimer = setTimeout(() => {
+      this.deferStop(new Error(`Tray worker did not acknowledge cleanup within ${this.stopTimeoutMs} ms; native resources retained safely`));
+    }, this.stopTimeoutMs);
+    // Cooperative shutdown: never terminate a live native WNDPROC on timeout.
+    // A native message also dismisses TrackPopupMenu while JS messages wait.
+    try {
+      if (this.nativeBridge?.hwnd) this.nativeBridge.post(this.nativeBridge.hwnd, 0x8002, 0, 0);
+    } catch (error) { Zotero.logError(error); }
+    try { this.worker.postMessage({ type: "stop" }); }
+    catch (error) { this.deferStop(error); }
     return this.stopPromise;
   }
 };

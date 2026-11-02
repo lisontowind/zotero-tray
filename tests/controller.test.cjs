@@ -5,9 +5,9 @@ const vm = require('node:vm');
 const fs = require('node:fs');
 const path = require('node:path');
 
-function setup() {
+function setup(application = { debug() {}, logError() {} }) {
   const sandbox = {
-    Zotero: { debug() {}, logError() {} },
+    Zotero: application,
     Services: { obs: { removeObserver() {} } },
     setTimeout, clearTimeout, Map, Error
   };
@@ -31,7 +31,7 @@ function setup() {
     listeners.get(type)?.(event);
     return event;
   }
-  return { controller, win, base, listeners, close };
+  return { controller, win, base, listeners, close, application };
 }
 
 test('close remains normal until tray is ready', () => {
@@ -159,4 +159,72 @@ test('duplicate appearance notifications are coalesced but native DPI refresh ca
   controller.appearance = () => ({ dark: false, taskbarDark: true, forcedColors: false });
   controller.updateAppearance();
   assert.equal(messages.length, 3);
+});
+
+test('unresponsive worker bounds shutdown while retaining native resources until late acknowledgement', async () => {
+  const { controller, base, close, application } = setup();
+  controller.ready = true;
+  close();
+  controller.stopTimeoutMs = 10;
+  let terminated = false, libraryClosed = false, chromeRemoved = false;
+  controller.worker = { postMessage() {}, terminate() { terminated = true; } };
+  controller.windowHandle = () => 'main-window';
+  controller.nativeBridge = {
+    isVisible: () => 0, foreground: () => 1,
+    user32: { close() { libraryClosed = true; } }
+  };
+  controller.chromeHandle = { destruct() { chromeRemoved = true; } };
+  assert.equal(await controller.stop(), false);
+  assert.equal(base.visibility, true);
+  assert.equal(controller.stopTimedOut, true);
+  assert.equal(application.__zoteroTrayPendingCleanup.has(controller), true);
+  assert.equal(terminated || libraryClosed || chromeRemoved, false);
+
+  application.isWin = true;
+  const replacement = setup(application).controller;
+  await replacement.start({});
+  assert.equal(replacement.worker, null); // A reload must not create a second native worker.
+
+  controller.onMessage({ type: 'stopped' });
+  assert.equal(terminated && libraryClosed && chromeRemoved, true);
+  assert.equal(controller.worker, null);
+  assert.equal(controller.stopTimedOut, false);
+  assert.equal(application.__zoteroTrayPendingCleanup, undefined);
+});
+
+test('cleanup failure resolves shutdown without unsafe termination and can release on a later acknowledgement', async () => {
+  const { controller, application } = setup();
+  let terminated = false;
+  controller.worker = {
+    postMessage() { queueMicrotask(() => controller.onMessage({ type: 'cleanup-error', message: 'DestroyWindow failed' })); },
+    terminate() { terminated = true; }
+  };
+  assert.equal(await controller.stop(), false);
+  assert.equal(terminated, false);
+  assert.equal(controller.stopTimer, null);
+  assert.ok(application.__zoteroTrayPendingCleanup.has(controller));
+  controller.onMessage({ type: 'stopped' });
+  assert.equal(terminated, true);
+});
+
+test('failure to send the native wake message still sends the cooperative JS stop', async () => {
+  const { controller } = setup();
+  controller.nativeBridge = {
+    hwnd: 'native-window', post() { throw Error('native post failed'); }, user32: { close() {} }
+  };
+  controller.worker = {
+    postMessage() { queueMicrotask(() => controller.onMessage({ type: 'stopped' })); }, terminate() {}
+  };
+  assert.equal(await controller.stop(), true);
+  assert.equal(controller.worker, null);
+});
+
+test('failure to send the JS stop does not leave shutdown pending forever', async () => {
+  const { controller } = setup();
+  let terminated = false;
+  controller.worker = { postMessage() { throw Error('worker unavailable'); }, terminate() { terminated = true; } };
+  assert.equal(await controller.stop(), false);
+  assert.equal(terminated, false);
+  controller.onMessage({ type: 'stopped' });
+  assert.equal(terminated, true);
 });

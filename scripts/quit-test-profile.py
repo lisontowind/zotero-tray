@@ -19,6 +19,10 @@ while time.monotonic() < deadline:
         assert result["cleaned"], result
         (ROOT / "artifacts" / "normal-quit-result.json").write_text(
             json.dumps({"passed": True, "nativeResourcesCleaned": True}), encoding="utf-8")
+        # Do not replay this one-shot quit request when the test profile restarts.
+        command_file = TEST / "command.json"
+        if command_file.exists() and json.loads(command_file.read_text(encoding="utf-8")).get("id") == request["id"]:
+            command_file.unlink()
         print("PASS tray Quit command completed normal Zotero shutdown and native cleanup")
         break
     time.sleep(0.1)

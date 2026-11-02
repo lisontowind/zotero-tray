@@ -48,6 +48,9 @@ try:
     if not initial["ready"]:
         initial = command("start")
     check("tray initialized", initial, lambda r: r["ready"])
+    check("idle native message pump stays near ten polls per second", command("measure-idle"),
+          lambda r: 0 < r["native"]["pumps"] <= r["native"]["elapsedMs"] / 100 + 2
+          and r["native"]["intervalMs"] == 100)
     for dark in [False, True]:
         command("appearance", appearance={"dark": dark, "taskbarDark": dark, "forcedColors": False})
         check(f"{'dark' if dark else 'light'} native menu and icon", command("inspect"),
@@ -107,6 +110,12 @@ try:
     command("start")
     command("worker-event", lp=0x7b)  # Open the actual native popup, then stop while it is tracking.
     check("disable dismisses native popup and releases resources", command("stop"), lambda r: not r["ready"])
+    command("start")
+    command("close")
+    check("delayed cleanup acknowledgement retains roots, restores window and eventually releases", command("deferred-stop"),
+          lambda r: not r["deferred"]["cleaned"] and r["deferred"]["timedOut"]
+          and r["deferred"]["workerRetained"] and r["deferred"]["rooted"]
+          and r["deferred"]["releasedAfterAck"] and r["mainWindows"][0]["visible"])
     command("start")
     command("restore")
 finally:

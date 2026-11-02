@@ -128,6 +128,7 @@ startup = async function(data, reason) {
         case "menu-command": ZoteroTray.worker.postMessage({ type: "test-menu", command: command.command }); break;
         case "appearance": ZoteroTray.worker.postMessage({ type: "appearance", ...command.appearance }); break;
         case "inspect":
+        case "measure-idle":
         case "background":
         case "menu-click": {
           const worker = ZoteroTray.worker;
@@ -140,7 +141,8 @@ startup = async function(data, reason) {
                 if (event.data.type === "test-state") { clearTimeout(timeout); resolve(event.data); }
               };
               worker.postMessage({ type: command.type === "menu-click" ? "test-menu-click"
-                : (command.type === "background" ? "test-background" : "test-inspect"), request: command.id });
+                : (command.type === "background" ? "test-background"
+                  : (command.type === "measure-idle" ? "test-measure-idle" : "test-inspect")), request: command.id });
             });
           } finally { worker.onmessage = original; }
           break;
@@ -167,6 +169,29 @@ startup = async function(data, reason) {
           break;
         }
         case "end-background": ZoteroTray.worker.postMessage({ type: "test-hide-fixture" }); break;
+        case "deferred-stop": {
+          const worker = ZoteroTray.worker;
+          const original = worker.onmessage;
+          let acknowledgement;
+          worker.onmessage = event => {
+            if (event.data.type === "stopped") acknowledgement = event;
+            else original(event);
+          };
+          const timeout = ZoteroTray.stopTimeoutMs;
+          try {
+            ZoteroTray.stopTimeoutMs = 50;
+            const cleaned = await ZoteroTray.stop();
+            details.deferred = { cleaned, timedOut: ZoteroTray.stopTimedOut,
+              workerRetained: ZoteroTray.worker === worker,
+              rooted: Zotero.__zoteroTrayPendingCleanup?.has(ZoteroTray) === true };
+            const deadline = Date.now() + 2000;
+            while (!acknowledgement && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 20));
+            if (!acknowledgement) throw new Error("No delayed cleanup acknowledgement");
+            original(acknowledgement);
+            details.deferred.releasedAfterAck = !ZoteroTray.worker && !Zotero.__zoteroTrayPendingCleanup;
+          } finally { ZoteroTray.stopTimeoutMs = timeout; }
+          break;
+        }
       }
       await new Promise(resolve => setTimeout(resolve, 250));
       await status({ commandId: command.id, ...details });
@@ -190,9 +215,17 @@ template = template.replace("__TEST__", json.dumps(str(TEST)))
 worker = (ROOT / "addon" / "content" / "tray-worker.js").read_text(encoding="utf-8")
 worker += r'''
 // TEST HARNESS ONLY: these messages are absent from the production package.
+let measuredPumps = 0;
+const productionPump = tray.pump.bind(tray);
+tray.pump = () => { measuredPumps++; return productionPump(); };
 const productionOnMessage = onmessage;
 onmessage = function(event) {
   if (event.data.type === "test-fail") tray.fail(new Error("Injected native worker failure"));
+  else if (event.data.type === "test-measure-idle") {
+    const before = measuredPumps, started = Date.now();
+    setTimeout(() => postMessage({ type: "test-state", pumps: measuredPumps - before,
+      elapsedMs: Date.now() - started, intervalMs: tray.pumpIntervalMs }), 2100);
+  }
   else if (event.data.type === "test-background" || event.data.type === "test-hide-fixture") {
     const showWindow = tray.libs[0].declare("ShowWindow", ctypes.winapi_abi, ctypes.int32_t, ctypes.voidptr_t, ctypes.int32_t);
     showWindow(tray.hwnd, event.data.type === "test-background" ? 5 : 0);

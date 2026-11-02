@@ -12,6 +12,8 @@ var tray = {
   callbackMessage: 0x8001, stopMessage: 0x8002,
   brushes: {}, font: null, palette: null, appearanceKey: null,
   accessibleItems: [], retiredBrushes: [],
+  pumpIntervalMs: 100, recoveryIntervalMs: 10000, recoveryRetryMs: 1000,
+  appearanceConfig: null, menuPosition: null,
 
   init(config) {
     const initStarted = Date.now();
@@ -121,6 +123,8 @@ var tray = {
     declare(user, "SetMenuInfo", t.BOOL, t.HANDLE, t.MENUINFO.ptr);
     declare(user, "SetMenuItemInfoW", t.BOOL, t.HANDLE, t.UINT, t.BOOL, t.MENUITEMINFO.ptr);
     declare(user, "GetDpiForWindow", t.UINT, t.HANDLE);
+    declare(user, "SetWindowPos", t.BOOL, t.HANDLE, t.HANDLE,
+      c.int32_t, c.int32_t, c.int32_t, c.int32_t, t.UINT);
     declare(user, "GetSystemMetricsForDpi", c.int32_t, c.int32_t, t.UINT);
     declare(user, "GetSysColor", t.DWORD, c.int32_t);
     declare(user, "FillRect", c.int32_t, t.HANDLE, t.RECT.ptr, t.HANDLE);
@@ -192,7 +196,7 @@ var tray = {
     this.nid.hIcon = this.icon;
     for (let i = 0; i < "Zotero".length; i++) this.nid.szTip[i] = "Zotero".charCodeAt(i);
     if (!this.addIcon()) this.nativeError("Shell_NotifyIconW(NIM_ADD)");
-    this.timer = setInterval(() => this.pump(), 30);
+    this.timer = setInterval(() => this.pump(), this.pumpIntervalMs);
     postMessage({ type: "ready", pointerBits: t.HANDLE.size * 8,
       readyAt: Date.now(), workerInitMs: Date.now() - initStarted,
       hwnd: c.cast(this.hwnd, c.uintptr_t).value.toString() });
@@ -236,6 +240,11 @@ var tray = {
         && !this.pending.some(event => event.type === "menu")) {
         // VERSION_4 uses WM_CONTEXTMENU. Also accepting legacy WM_RBUTTONUP
         // queues a second popup for the same click, reopening it after Show.
+        // VERSION_4 provides the icon/keyboard anchor in wParam, including
+        // signed coordinates on monitors left of or above the primary display.
+        const packed = Number((wp.value ?? wp).toString());
+        const x = (packed << 16) >> 16, y = packed >> 16;
+        this.menuPosition = x === -1 && y === -1 ? null : { x, y };
         this.pending.push({ type: "menu" });
       }
       return t.LRESULT(0);
@@ -258,6 +267,7 @@ var tray = {
 
   applyAppearance(config) {
     const a = this.api, t = this.types;
+    this.appearanceConfig = { ...config };
     this.dpi = a.GetDpiForWindow(this.hwnd) || 96;
     const system = { menu: a.GetSysColor(4), text: a.GetSysColor(7),
       highlight: a.GetSysColor(13), highlightText: a.GetSysColor(14), gray: a.GetSysColor(17) };
@@ -355,7 +365,8 @@ var tray = {
         else postMessage(event);
       }
       // Explorer may not be ready on the first TaskbarCreated broadcast.
-      if (Date.now() - this.lastCheck > 2000) {
+      const checkInterval = this.recoveryFailures ? this.recoveryRetryMs : this.recoveryIntervalMs;
+      if (Date.now() - this.lastCheck > checkInterval) {
         this.lastCheck = Date.now();
         if (!this.api.Shell_NotifyIconW(1, this.nid.address()) && !this.addIcon()) {
           if (++this.recoveryFailures >= 5) throw new Error("Could not restore tray icon after Explorer restart");
@@ -366,7 +377,14 @@ var tray = {
 
   showMenu() {
     const a = this.api, point = this.types.POINT();
-    if (!a.GetCursorPos(point.address())) this.nativeError("GetCursorPos");
+    if (this.menuPosition) {
+      point.x = this.menuPosition.x; point.y = this.menuPosition.y;
+      this.menuPosition = null;
+    } else if (!a.GetCursorPos(point.address())) this.nativeError("GetCursorPos");
+    // Move only our invisible owner window so GetDpiForWindow and the popup
+    // use the clicked taskbar's monitor, without activating or resizing it.
+    if (!a.SetWindowPos(this.hwnd, null, point.x, point.y, 0, 0, 0x15)) this.nativeError("SetWindowPos");
+    this.applyAppearance(this.appearanceConfig);
     a.SetForegroundWindow(this.hwnd);
     this.inMenu = true;
     // TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON: selection is a return
@@ -423,7 +441,7 @@ var tray = {
     // Never forcibly terminate a thread that still owns a native callback.
     // Keep this worker alive if cleanup itself fails, so its callback stays rooted.
     try { this.cleanup(); }
-    catch (cleanupError) { postMessage({ type: "log", message: `Cleanup failed: ${cleanupError}` }); }
+    catch (cleanupError) { postMessage({ type: "cleanup-error", message: `Cleanup failed: ${cleanupError}` }); }
   }
 };
 
