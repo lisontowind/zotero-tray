@@ -5,13 +5,21 @@ on:
     tags: ["v*"]
   pull_request:
   workflow_dispatch:
+    inputs:
+      native_windows:
+        description: Run native tests on a self-hosted Windows x64 runner with Zotero 10
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 jobs:
   verify:
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -20,10 +28,35 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-      - run: node --test tests/*.test.cjs
+      - run: node --test tests/controller.test.cjs tests/appearance.test.cjs tests/tray-events.test.cjs tests/worker-native.test.cjs
       - run: python -m unittest discover -s tests -p test_package.py
       - if: startsWith(github.ref, 'refs/tags/')
         run: python scripts/build.py --tag "$GITHUB_REF_NAME"
+        shell: bash
+
+  native-windows:
+    if: github.event_name == 'workflow_dispatch' && inputs.native_windows
+    runs-on: [self-hosted, Windows, X64]
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: python scripts/run-windows-tests.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: native-windows-results
+          path: |
+            artifacts/integration-results.json
+            artifacts/normal-quit-result.json
+            artifacts/production-*-result.json
+            artifacts/test-profile/native-stdout.log
+            artifacts/test-profile/production-stdout.log
 
   release:
     if: startsWith(github.ref, 'refs/tags/')

@@ -10,10 +10,13 @@ var tray = {
   timer: null, stopping: false, registered: false, added: false,
   pending: [], inMenu: false, lastCheck: 0, recoveryFailures: 0,
   callbackMessage: 0x8001, stopMessage: 0x8002,
-  brushes: {}, font: null, palette: null, appearanceKey: null,
-  accessibleItems: [], retiredBrushes: [],
+  brushes: {}, font: null, palette: null, menuAppearanceKey: null,
+  fontDpi: null, iconAppearanceKey: null,
+  accessibleItems: [], retiredBrushes: [], retiredIcons: [],
   pumpIntervalMs: 100, recoveryIntervalMs: 10000, recoveryRetryMs: 1000,
   appearanceConfig: null, menuPosition: null,
+  cleanupTimer: null, cleanupAttempts: 0, cleanupComplete: false,
+  cleanupMaxAttempts: 4, cleanupRetryMs: 250,
 
   init(config) {
     const initStarted = Date.now();
@@ -273,53 +276,81 @@ var tray = {
       highlight: a.GetSysColor(13), highlightText: a.GetSysColor(14), gray: a.GetSysColor(17) };
     // GetSysColor returns COLORREF (BGR); palette and icon helpers use RGB.
     for (const key of Object.keys(system)) system[key] = TrayAppearance.colorRef(system[key]);
-    const key = JSON.stringify([config.dark, config.taskbarDark, config.forcedColors, this.dpi, system]);
-    if (key === this.appearanceKey) return;
-    this.palette = TrayAppearance.palette(config.dark, config.forcedColors, system);
-    const oldBrushes = this.brushes;
-    this.retiredBrushes.push(...Object.values(oldBrushes));
-    this.brushes = {};
-    for (const role of ["background", "selected", "separator"]) {
-      this.brushes[role] = a.CreateSolidBrush(TrayAppearance.colorRef(this.palette[role]));
-      if (this.brushes[role].isNull()) this.nativeError("CreateSolidBrush");
-    }
-    const info = t.MENUINFO();
-    info.cbSize = t.MENUINFO.size;
-    info.fMask = 0x12; // MIM_BACKGROUND | MIM_STYLE
-    info.dwStyle = 0x80000000; // MNS_NOCHECK
-    info.hbrBack = this.brushes.background;
-    if (!a.SetMenuInfo(this.menu, info.address())) this.nativeError("SetMenuInfo");
-    for (const brush of this.retiredBrushes) a.DeleteObject(brush);
-    this.retiredBrushes = [];
-    if (this.font) a.DeleteObject(this.font);
-    this.font = a.CreateFontW(-Math.round(14 * this.dpi / 96), 0, 0, 0, 400,
-      0, 0, 0, 1, 0, 0, 5, 0, "Segoe UI");
-    if (this.font.isNull()) this.nativeError("CreateFontW");
-    const dc = a.GetDC(this.hwnd);
-    if (dc.isNull()) this.nativeError("GetDC");
-    const previous = a.SelectObject(dc, this.font);
-    try {
-      this.menuWidth = Math.round(140 * this.dpi / 96);
-      for (const label of Object.values(this.labels)) {
-        const extent = t.POINT();
-        if (!a.GetTextExtentPoint32W(dc, label, label.length, extent.address())) this.nativeError("GetTextExtentPoint32W");
-        this.menuWidth = Math.max(this.menuWidth, extent.x + Math.round(40 * this.dpi / 96));
+    const palette = TrayAppearance.palette(config.dark, config.forcedColors, system);
+    const menuKey = JSON.stringify(palette);
+    let changed = false;
+    if (menuKey !== this.menuAppearanceKey) {
+      this.palette = palette;
+      this.retiredBrushes.push(...Object.values(this.brushes));
+      this.brushes = {};
+      for (const role of ["background", "selected", "separator"]) {
+        this.brushes[role] = a.CreateSolidBrush(TrayAppearance.colorRef(palette[role]));
+        if (this.brushes[role].isNull()) this.nativeError("CreateSolidBrush");
       }
-    } finally { a.SelectObject(dc, previous); a.ReleaseDC(this.hwnd, dc); }
-    const size = Math.max(16, Math.min(128, a.GetSystemMetricsForDpi(49, this.dpi)));
-    const pixels = TrayAppearance.iconDIB(size, config.taskbarDark, config.forcedColors, system.text);
-    const nativeBytes = ctypes.uint8_t.array(pixels.length)(Array.from(pixels));
-    const icon = a.CreateIconFromResourceEx(nativeBytes, pixels.length, 1, 0x30000, size, size, 0);
-    if (icon.isNull()) this.nativeError("CreateIconFromResourceEx");
-    const oldIcon = this.icon;
-    this.icon = icon;
-    if (this.nid) {
-      this.nid.hIcon = icon;
-      if (this.added && !a.Shell_NotifyIconW(1, this.nid.address())) this.lastCheck = 0;
+      const info = t.MENUINFO();
+      info.cbSize = t.MENUINFO.size;
+      info.fMask = 0x12; // MIM_BACKGROUND | MIM_STYLE
+      info.dwStyle = 0x80000000; // MNS_NOCHECK
+      info.hbrBack = this.brushes.background;
+      if (!a.SetMenuInfo(this.menu, info.address())) this.nativeError("SetMenuInfo");
+      this.releaseRetiredBrushes();
+      this.menuAppearanceKey = menuKey;
+      changed = true;
     }
-    if (oldIcon) a.DestroyIcon(oldIcon);
-    this.appearanceKey = key;
-    postMessage({ type: "log", message: `Appearance: menu=${config.dark ? "dark" : "light"}, taskbar=${config.taskbarDark ? "dark" : "light"}, highContrast=${!!config.forcedColors}, dpi=${this.dpi}` });
+    if (this.dpi !== this.fontDpi) {
+      if (this.font) {
+        if (!a.DeleteObject(this.font)) this.nativeError("DeleteObject(font)");
+        this.font = null;
+      }
+      this.font = a.CreateFontW(-Math.round(14 * this.dpi / 96), 0, 0, 0, 400,
+        0, 0, 0, 1, 0, 0, 5, 0, "Segoe UI");
+      if (this.font.isNull()) this.nativeError("CreateFontW");
+      const dc = a.GetDC(this.hwnd);
+      if (dc.isNull()) this.nativeError("GetDC");
+      const previous = a.SelectObject(dc, this.font);
+      try {
+        this.menuWidth = Math.round(140 * this.dpi / 96);
+        for (const label of Object.values(this.labels)) {
+          const extent = t.POINT();
+          if (!a.GetTextExtentPoint32W(dc, label, label.length, extent.address())) this.nativeError("GetTextExtentPoint32W");
+          this.menuWidth = Math.max(this.menuWidth, extent.x + Math.round(40 * this.dpi / 96));
+        }
+      } finally { a.SelectObject(dc, previous); a.ReleaseDC(this.hwnd, dc); }
+      this.fontDpi = this.dpi;
+      changed = true;
+    }
+    const size = Math.max(16, Math.min(128, a.GetSystemMetricsForDpi(49, this.dpi)));
+    const iconKey = JSON.stringify([size, config.forcedColors ? system.text : !!config.taskbarDark, !!config.forcedColors]);
+    if (iconKey !== this.iconAppearanceKey) {
+      const pixels = TrayAppearance.iconDIB(size, config.taskbarDark, config.forcedColors, system.text);
+      const nativeBytes = ctypes.uint8_t.array(pixels.length)(Array.from(pixels));
+      const icon = a.CreateIconFromResourceEx(nativeBytes, pixels.length, 1, 0x30000, size, size, 0);
+      if (icon.isNull()) this.nativeError("CreateIconFromResourceEx");
+      if (this.icon) this.retiredIcons.push(this.icon);
+      this.icon = icon;
+      if (this.nid) {
+        this.nid.hIcon = icon;
+        if (this.added && !a.Shell_NotifyIconW(1, this.nid.address())) this.lastCheck = 0;
+      }
+      this.releaseRetiredIcons();
+      this.iconAppearanceKey = iconKey;
+      changed = true;
+    }
+    if (changed) postMessage({ type: "log", message: `Appearance: menu=${config.dark ? "dark" : "light"}, taskbar=${config.taskbarDark ? "dark" : "light"}, highContrast=${!!config.forcedColors}, dpi=${this.dpi}` });
+  },
+
+  releaseRetiredBrushes() {
+    while (this.retiredBrushes.length) {
+      if (!this.api.DeleteObject(this.retiredBrushes[0])) this.nativeError("DeleteObject(brush)");
+      this.retiredBrushes.shift();
+    }
+  },
+
+  releaseRetiredIcons() {
+    while (this.retiredIcons.length) {
+      if (!this.api.DestroyIcon(this.retiredIcons[0])) this.nativeError("DestroyIcon");
+      this.retiredIcons.shift();
+    }
   },
 
   drawMenuItem(item) {
@@ -356,7 +387,7 @@ var tray = {
         this.api.TranslateMessage(msg.address());
         this.api.DispatchMessageW(msg.address());
       }
-      if (this.stopping) { this.cleanup(); return; }
+      if (this.stopping) { this.requestCleanup(); return; }
       const events = this.pending.splice(0);
       for (const event of events) {
         if (event.type === "fatal") throw new Error(event.message);
@@ -389,13 +420,33 @@ var tray = {
     this.inMenu = true;
     // TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON: selection is a return
     // value, so there is no menu callback or DOM access inside the WNDPROC.
-    const command = a.TrackPopupMenu(this.menu, 0x100 | 0x80 | 2,
-      point.x, point.y, 0, this.hwnd, null);
-    this.inMenu = false;
+    let command;
+    try {
+      command = a.TrackPopupMenu(this.menu, 0x100 | 0x80 | 2,
+        point.x, point.y, 0, this.hwnd, null);
+    } finally { this.inMenu = false; }
     a.PostMessageW(this.hwnd, 0, 0, 0); // Win32 notification-area menu dismissal rule
     if (!this.stopping) {
       if (command === 1) postMessage({ type: "show" });
       if (command === 2) postMessage({ type: "quit" });
+    }
+  },
+
+  requestCleanup() {
+    if (this.cleanupComplete || this.cleanupTimer !== null
+      || this.cleanupAttempts >= this.cleanupMaxAttempts) return;
+    this.cleanupAttempts++;
+    try { this.cleanup(); }
+    catch (error) {
+      if (this.cleanupAttempts < this.cleanupMaxAttempts) {
+        this.cleanupTimer = setTimeout(() => {
+          this.cleanupTimer = null;
+          this.requestCleanup();
+        }, this.cleanupRetryMs);
+        postMessage({ type: "log", message: `Cleanup attempt ${this.cleanupAttempts} failed; retrying: ${error}` });
+      } else {
+        postMessage({ type: "cleanup-error", message: `Cleanup failed after ${this.cleanupAttempts} attempts: ${error}` });
+      }
     }
   },
 
@@ -424,15 +475,24 @@ var tray = {
       if (!a.DestroyIcon(this.icon)) this.nativeError("DestroyIcon");
       this.icon = null;
     }
-    if (this.font) { a.DeleteObject(this.font); this.font = null; }
-    for (const brush of Object.values(this.brushes)) a.DeleteObject(brush);
-    for (const brush of this.retiredBrushes) a.DeleteObject(brush);
-    this.brushes = {};
-    this.retiredBrushes = [];
+    if (this.font && !this.font.isNull()) {
+      if (!a.DeleteObject(this.font)) this.nativeError("DeleteObject(font)");
+      this.font = null;
+    }
+    for (const [role, brush] of Object.entries(this.brushes)) {
+      if (!brush.isNull() && !a.DeleteObject(brush)) this.nativeError("DeleteObject(brush)");
+      delete this.brushes[role];
+    }
+    this.releaseRetiredBrushes();
+    this.releaseRetiredIcons();
     this.nid = null;
+    while (this.libs.length) {
+      this.libs[this.libs.length - 1].close();
+      this.libs.pop();
+    }
     this.api = {};
-    for (const lib of this.libs.reverse()) lib.close();
-    this.libs = [];
+    this.pending = [];
+    this.cleanupComplete = true;
     postMessage({ type: "stopped" });
   },
 
@@ -440,18 +500,16 @@ var tray = {
     postMessage({ type: "error", message: `${error.name}: ${error.message}\n${error.stack || ""}` });
     // Never forcibly terminate a thread that still owns a native callback.
     // Keep this worker alive if cleanup itself fails, so its callback stays rooted.
-    try { this.cleanup(); }
-    catch (cleanupError) { postMessage({ type: "cleanup-error", message: `Cleanup failed: ${cleanupError}` }); }
+    this.requestCleanup();
   }
 };
 
 onmessage = function (event) {
   try {
     if (event.data.type === "init") tray.init(event.data);
-    else if (event.data.type === "appearance" && tray.hwnd) tray.applyAppearance(event.data);
+    else if (event.data.type === "appearance" && tray.hwnd && !tray.stopping) tray.applyAppearance(event.data);
     else if (event.data.type === "stop") {
-      if (tray.libs.length) tray.cleanup();
-      else postMessage({ type: "stopped" });
+      tray.requestCleanup();
     }
   } catch (error) { tray.fail(error); }
 };

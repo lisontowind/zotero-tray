@@ -6,7 +6,7 @@
 
 ## 安装和使用
 
-1. 从 [GitHub Releases](https://github.com/lisontowind/zotero-tray/releases) 下载发行包，或构建 `dist/zotero-tray-0.1.3.xpi`。作者为 [lisontowind](https://github.com/lisontowind)。
+1. 从 [GitHub Releases](https://github.com/lisontowind/zotero-tray/releases) 下载已发布的发行包，或构建 `dist/zotero-tray-0.1.4.xpi`。作者为 [lisontowind](https://github.com/lisontowind)。
 2. 在 Zotero 的“工具 → 插件”中停用旧的 Minimize Zotero To Tray，避免两个插件同时拦截关闭事件。
 3. 通过插件窗口的齿轮菜单选择“从文件安装插件”，选择本项目的 `.xpi`。
 4. Zotero 启动后会出现托盘图标。如果 Windows 把图标放在折叠区域，可在任务栏的隐藏图标区域找到它。
@@ -29,13 +29,25 @@
 
 ```powershell
 python scripts/build.py
-node --test tests/controller.test.cjs tests/appearance.test.cjs tests/tray-events.test.cjs
+node --test tests/controller.test.cjs tests/appearance.test.cjs tests/tray-events.test.cjs tests/worker-native.test.cjs
 python -m unittest discover -s tests -p test_package.py
 ```
 
 构建脚本固定 ZIP 条目时间与顺序，输出 `.xpi`、`.xpi.sha256` 和 `dist/updates.json`。更新清单包含插件 ID、版本、固定版本下载链接、SHA-256 及兼容范围。安装包不包含测试驱动。
 
-发布时运行 `python scripts/build.py --tag v0.1.3`，标签必须与清单版本一致。推送版本标签会触发 `.github/workflows/release.yml`：先测试，再创建包含 XPI、校验文件和更新清单的 GitHub Release 草稿。核对草稿后正式发布，`releases/latest/download/updates.json` 才会提供该版本；草稿和预发布版本不作为稳定更新入口。普通 PR 和手动运行工作流只做验证。
+发布时运行 `python scripts/build.py --tag v0.1.4`，标签必须与清单版本一致。推送版本标签会触发 `.github/workflows/release.yml`：先在 Linux 和 Windows 上测试，再创建包含 XPI、校验文件和更新清单的 GitHub Release 草稿。核对草稿后正式发布，`releases/latest/download/updates.json` 才会提供该版本；草稿和预发布版本不作为稳定更新入口。普通 PR 和手动运行工作流只做验证。
+
+Windows 上推荐使用一键真实测试入口（需要 Node.js、Python 和已安装的 Zotero 10）：
+
+```powershell
+python scripts/run-windows-tests.py
+# Zotero 安装在其他位置时：
+python scripts/run-windows-tests.py --zotero "D:\Apps\Zotero\zotero.exe"
+```
+
+脚本先执行单元和打包测试，再生成测试驱动并离线安装到 `artifacts/test-profile/profile`，启动独立 Zotero 实例，执行集成测试并正常退出。随后以正式 XPI 重启同一独立配置，核对生产包信息及隐藏/恢复行为，再正常退出。测试配置固定使用自己的数据目录和 Marionette 端口 2829；端口已被使用时拒绝启动。Marionette 安装与退出操作会核对配置目录，避免操作日常实例。日志保存在 `artifacts/test-profile/native-stdout.log` 和 `production-stdout.log`。测试失败时也尝试正常退出，不强制终止 Zotero。
+
+GitHub Actions 的手动运行选项 `native_windows` 默认关闭；启用前需配置具有交互桌面、已安装 Zotero 10 的 Windows x64 自托管运行器。原生测试结果及日志会作为工作流附件保存。真实多屏、Explorer 重启和休眠恢复仍按 [Windows 人工验证清单](docs/windows-validation.md) 检查。
 
 真实集成测试使用工作区内的独立 Zotero 配置和数据目录，不访问日常文献库：
 
@@ -57,7 +69,7 @@ python scripts/quit-test-profile.py
 
 ## 安全和兼容性说明
 
-已验证的平台和具体结果见 `VALIDATION-0.1.3.md`；旧版 `VALIDATION*.md` 保留历史记录。当前清单允许 Zotero 10.0.x；其他版本、32 位及 ARM 原生环境尚未验证。
+已验证的平台和具体结果见 `VALIDATION-0.1.4.md`；旧版 `VALIDATION*.md` 保留历史记录。当前清单允许 Zotero 10.0.x；其他版本、32 位及 ARM 原生环境尚未验证。
 
 插件只加载 Windows 系统目录中的系统 DLL。托盘和自绘菜单在专用 ChromeWorker 中运行，Windows 回调、消息窗口和消息泵属于同一线程。主窗口的原生窗口过程不被替换。清理采用协作停止，菜单打开时也可退出，避免留下失效的原生回调。
 
@@ -66,6 +78,10 @@ python scripts/quit-test-profile.py
 从 0.1.3 起，HTTPS `update_url` 指向本仓库 GitHub Releases 的 `updates.json`。更新请求由 Zotero 自身发起，插件运行代码不访问网络。正式发布时必须把构建生成的 `updates.json` 与对应 XPI 一起作为附件上传；仅修改清单无法让尚未发布的版本在线更新。0.1.2 及更早版本使用 `.invalid` 占位域名，无法自动发现新地址，需要先手动安装一次新版本。
 
 正常停止优先等待 Worker 释放全部原生资源。等待超过 5 秒或原生清理失败时，先恢复窗口并移除关闭拦截，再返回未完成状态；应用级保留集合继续持有 Worker、回调及 DLL，防止插件作用域卸载后出现悬空指针。延迟确认到达后才终止 Worker 并释放其余资源。未确认期间阻止再次启动托盘；若始终不能清理，需要正常重启 Zotero。
+
+0.1.4 为原生清理增加最多 4 次尝试，失败后间隔 250 ms 再试；每项资源仅在成功释放后移除引用，回调保留到消息窗口销毁且窗口类注销完成。清理次数耗尽后保持资源引用，不强制终止 Worker。主线程 DLL 在打开后立即登记，函数声明失败时也能回收。
+
+托盘故障和清理持续失败会显示非阻塞通知，重复故障不会连续弹出。点击 Windows 通知会复制包含插件版本、Zotero 版本、启动耗时和错误堆栈的诊断 JSON；不读取文献条目。系统通知不可用时使用 Zotero 提示窗口，并引导查看调试日志。正常退出或系统会话结束期间不弹出故障通知。
 
 本项目为独立实现，不复用旧插件的 AutoHotkey 程序。代码采用 MIT 许可证。
 
@@ -93,3 +109,5 @@ for (let addon of addons) {
 0.1.1 同时修复了兼容新旧右键事件时产生的重复菜单：选择“显示 Zotero”后，菜单不再因旧事件残留而再次打开。
 
 0.1.3 把消息泵间隔由 30 ms 调整为 100 ms，理论定时触发次数约减少 70%；这不等同于 CPU 或功耗降低 70%，事件派发最多增加约 70 ms 的轮询等待。健康状态下图标检查由每 2 秒调整为每 10 秒，Explorer 的 `TaskbarCreated` 广播会立即触发恢复检查，失败后每秒重试。菜单使用 Windows 提供的托盘坐标（支持负坐标），弹出前把隐藏的菜单所有者移到该位置并按实际窗口 DPI 更新外观，不移动 Zotero 主窗口。真实混合 DPI 多屏仍需额外设备验证。
+
+0.1.4 将菜单配色、字体与菜单文字尺寸、托盘图标分别缓存。只切换 Zotero 主题时不重建字体或图标；只切换任务栏主题时不重建菜单画刷；DPI 改变时重新计算字体和菜单宽度，图标按实际像素尺寸更新。性能验证记录原生资源创建次数，未将减少创建次数等同于 CPU 或电量的具体降幅。

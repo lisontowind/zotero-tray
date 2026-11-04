@@ -3,6 +3,7 @@ import json
 import socket
 import sys
 import os
+from pathlib import Path
 
 
 class Client:
@@ -55,6 +56,14 @@ class Client:
             "script": source, "args": args or [], "newSandbox": False, "sandbox": "system", "scriptTimeout": 20000
         })
         return result.get("value", result)
+
+    def require_profile(self, expected):
+        result = self.call("WebDriver:GetCapabilities")
+        capabilities = result.get("value", result)
+        capabilities = capabilities.get("capabilities", capabilities)
+        profile = capabilities.get("moz:profile")
+        if not profile or Path(profile).resolve() != Path(expected).resolve():
+            raise RuntimeError(f"Refusing to control unexpected profile: {profile}")
 
     def close(self):
         try:

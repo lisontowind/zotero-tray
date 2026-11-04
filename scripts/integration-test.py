@@ -56,6 +56,16 @@ try:
         check(f"{'dark' if dark else 'light'} native menu and icon", command("inspect"),
               lambda r, dark=dark: r["native"]["iconPresent"] and r["native"]["palette"]["background"] == (0x252526 if dark else 0xffffff)
               and len(r["native"]["accessibleLabels"]) == 3 and all(r["native"]["accessibleLabels"][i] for i in [0, 2]))
+    before_resources = command("inspect")["native"]["resourceCreates"]
+    command("appearance", appearance={"dark": False, "taskbarDark": True, "forcedColors": False})
+    menu_resources = command("inspect")["native"]["resourceCreates"]
+    check("menu-only theme change reuses native font and icon", {"before": before_resources, "after": menu_resources},
+          lambda r: r["after"]["icons"] == r["before"]["icons"] and r["after"]["fonts"] == r["before"]["fonts"]
+          and r["after"]["brushes"] == r["before"]["brushes"] + 3)
+    command("appearance", appearance={"dark": False, "taskbarDark": False, "forcedColors": False})
+    check("taskbar-only theme change reuses native menu resources", {"before": menu_resources, "after": command("inspect")["native"]["resourceCreates"]},
+          lambda r: r["after"]["icons"] == r["before"]["icons"] + 1 and r["after"]["fonts"] == r["before"]["fonts"]
+          and r["after"]["brushes"] == r["before"]["brushes"])
     command("appearance", appearance={"dark": True, "taskbarDark": True, "forcedColors": True})
     check("Windows high contrast rendering initializes", command("inspect"), lambda r: r["native"]["iconPresent"])
     command("appearance", appearance={"dark": True, "taskbarDark": True, "forcedColors": False})
@@ -116,6 +126,11 @@ try:
           lambda r: not r["deferred"]["cleaned"] and r["deferred"]["timedOut"]
           and r["deferred"]["workerRetained"] and r["deferred"]["rooted"]
           and r["deferred"]["releasedAfterAck"] and r["mainWindows"][0]["visible"])
+    command("start")
+    command("close")
+    check("transient native cleanup failure retries and releases resources", command("retry-stop"),
+          lambda r: r["retryStop"]["cleaned"] and r["retryStop"]["attempts"] == 2
+          and not r["ready"] and r["mainWindows"][0]["visible"])
     command("start")
     command("restore")
 finally:

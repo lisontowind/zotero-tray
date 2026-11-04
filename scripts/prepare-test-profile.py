@@ -7,6 +7,12 @@ The command bridge exists only in this test harness, NOT in the shipped XPI.
 import json
 from pathlib import Path
 import shutil
+import argparse
+import zipfile
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--install", action="store_true", help="Install the harness XPI before starting the isolated profile")
+args = parser.parse_args()
 
 ROOT = Path(__file__).resolve().parents[1]
 TEST = ROOT / "artifacts" / "test-profile"
@@ -192,6 +198,25 @@ startup = async function(data, reason) {
           } finally { ZoteroTray.stopTimeoutMs = timeout; }
           break;
         }
+        case "retry-stop": {
+          const worker = ZoteroTray.worker, original = worker.onmessage;
+          let attempts = 0;
+          try {
+            await new Promise((resolve, reject) => {
+              const timeout = setTimeout(() => reject(new Error("Cleanup fixture timed out")), 3000);
+              worker.onmessage = event => {
+                if (event.data.type === "test-cleanup-attempt") attempts = event.data.attempt;
+                else if (event.data.type === "test-cleanup-ready") { clearTimeout(timeout); resolve(); }
+                else original(event);
+              };
+              worker.postMessage({ type: "test-cleanup-retry" });
+            });
+            details.retryStop = { cleaned: await ZoteroTray.stop(), attempts };
+          } finally {
+            if (ZoteroTray.worker === worker) worker.onmessage = original;
+          }
+          break;
+        }
       }
       await new Promise(resolve => setTimeout(resolve, 250));
       await status({ commandId: command.id, ...details });
@@ -218,9 +243,32 @@ worker += r'''
 let measuredPumps = 0;
 const productionPump = tray.pump.bind(tray);
 tray.pump = () => { measuredPumps++; return productionPump(); };
+let instrumentedAPI;
+const resourceCreates = { brushes: 0, fonts: 0, icons: 0 };
+const productionAppearance = tray.applyAppearance.bind(tray);
+tray.applyAppearance = config => {
+  if (instrumentedAPI !== tray.api) {
+    for (const [name, key] of [["CreateSolidBrush", "brushes"], ["CreateFontW", "fonts"], ["CreateIconFromResourceEx", "icons"]]) {
+      const original = tray.api[name];
+      tray.api[name] = (...args) => { resourceCreates[key]++; return original(...args); };
+    }
+    instrumentedAPI = tray.api;
+  }
+  return productionAppearance(config);
+};
 const productionOnMessage = onmessage;
 onmessage = function(event) {
   if (event.data.type === "test-fail") tray.fail(new Error("Injected native worker failure"));
+  else if (event.data.type === "test-cleanup-retry") {
+    const destroy = tray.api.DestroyWindow;
+    let first = true;
+    tray.api.DestroyWindow = hwnd => {
+      postMessage({ type: "test-cleanup-attempt", attempt: tray.cleanupAttempts });
+      if (first) { first = false; return 0; }
+      return destroy(hwnd);
+    };
+    postMessage({ type: "test-cleanup-ready" });
+  }
   else if (event.data.type === "test-measure-idle") {
     const before = measuredPumps, started = Date.now();
     setTimeout(() => postMessage({ type: "test-state", pumps: measuredPumps - before,
@@ -256,7 +304,8 @@ onmessage = function(event) {
   else if (event.data.type === "test-inspect") {
     postMessage({ type: "test-state", request: event.data.request,
       iconPresent: !!tray.api.Shell_NotifyIconW(1, tray.nid.address()),
-      palette: tray.palette, dpi: tray.dpi, accessibleLabels: tray.accessibleItems.map(i => i.text.readString()) });
+      palette: tray.palette, dpi: tray.dpi, resourceCreates,
+      accessibleLabels: tray.accessibleItems.map(i => i.text.readString()) });
   }
   else if (event.data.type === "test-drop-icon") {
     tray.api.Shell_NotifyIconW(2, tray.nid.address());
@@ -271,4 +320,13 @@ onmessage = function(event) {
 '''
 (HARNESS / "content" / "tray-worker.js").write_text(worker, encoding="utf-8")
 shutil.copyfile(ROOT / "addon" / "content" / "appearance.js", HARNESS / "content" / "appearance.js")
+if args.install:
+    package = TEST / "harness.xpi"
+    with zipfile.ZipFile(package, "w") as archive:
+        for file in sorted(HARNESS.rglob("*")):
+            if file.is_file():
+                archive.write(file, file.relative_to(HARNESS).as_posix())
+    shutil.copyfile(package, proxy.with_name(proxy.name + ".xpi"))
+    if proxy.is_file():
+        proxy.unlink()
 print(f'"C:\\Program Files\\Zotero\\zotero.exe" -no-remote -profile "{PROFILE}" -ZoteroDebugText')

@@ -31,7 +31,7 @@ function setup(application = { debug() {}, logError() {} }) {
     listeners.get(type)?.(event);
     return event;
   }
-  return { controller, win, base, listeners, close, application };
+  return { controller, win, base, listeners, close, application, sandbox };
 }
 
 test('close remains normal until tray is ready', () => {
@@ -227,4 +227,87 @@ test('failure to send the JS stop does not leave shutdown pending forever', asyn
   assert.equal(terminated, false);
   controller.onMessage({ type: 'stopped' });
   assert.equal(terminated, true);
+});
+
+test('each native bridge declaration failure closes the already opened DLL', async () => {
+  for (const failAt of [1, 2, 3]) {
+    const { controller, sandbox, application, base } = setup();
+    let closed = 0, terminated = 0, declarations = 0, removed = 0;
+    application.isWin = true;
+    application.getMainWindows = () => [];
+    controller.appearance = () => ({});
+    sandbox.Services = {
+      io: { newURI: x => x }, obs: { addObserver() {}, removeObserver() {} },
+      dirsvc: { get: () => ({ path: 'C:\\Windows\\System32' }) },
+      locale: { appLocaleAsBCP47: 'en-US' }
+    };
+    sandbox.Components = {
+      interfaces: {}, classes: { '@mozilla.org/addons/addon-manager-startup;1': {
+        getService: () => ({ registerChrome: () => ({ destruct() { removed++; } }) })
+      } }
+    };
+    sandbox.ChromeUtils = { importESModule: () => ({ ctypes: { open: () => ({
+      declare() { if (++declarations === failAt) throw Error('injected declaration failure'); return () => 1; },
+      close() { closed++; }
+    }) } }) };
+    sandbox.ChromeWorker = function() {
+      this.postMessage = message => {
+        if (message.type === 'stop') queueMicrotask(() => this.onmessage({ data: { type: 'stopped' } }));
+      };
+      this.terminate = () => { terminated++; };
+    };
+    await controller.start({ rootURI: 'test/', version: 'test' });
+    await controller.stop();
+    assert.equal(closed, 1);
+    assert.equal(terminated, 1);
+    assert.equal(removed, 1);
+    assert.equal(controller.nativeBridge, null);
+    assert.equal(base.visibility, true);
+  }
+});
+
+test('failure notifications are deduplicated and copy diagnostics only on a click', async () => {
+  const { controller, sandbox, application } = setup();
+  const notices = [], copies = [];
+  application.version = '10.0.7';
+  sandbox.Services.locale = { appLocaleAsBCP47: 'zh-CN' };
+  sandbox.Components = { interfaces: {}, classes: {
+    '@mozilla.org/alerts-service;1': { getService: () => ({ showAlertNotification(...args) { notices.push(args); } }) },
+    '@mozilla.org/widget/clipboardhelper;1': { getService: () => ({ copyString(value) { copies.push(value); } }) }
+  } };
+  controller.fail(Error('example fault'));
+  await controller.stop();
+  controller.fail(Error('repeated fault'));
+  assert.equal(notices.length, 1);
+  assert.equal(copies.length, 0);
+  const observer = notices[0][5];
+  observer.observe(null, 'alertfinished');
+  assert.equal(copies.length, 0);
+  observer.observe(null, 'alertclickcallback');
+  assert.equal(JSON.parse(copies[0]).zoteroVersion, '10.0.7');
+  assert.match(JSON.parse(copies[0]).error, /example fault/);
+  controller.deferStop(Error('cleanup exhausted'));
+  assert.equal(notices.length, 2);
+  assert.match(notices[1][2], /重启 Zotero/);
+  assert.equal(JSON.parse(controller.diagnostics()).cleanupPending, true);
+  controller.notifyFailure();
+  controller.notifyFailure(true);
+  assert.equal(notices.length, 2);
+});
+
+test('unavailable desktop notifications use a non-modal fallback and shutdown stays silent', () => {
+  const { controller, sandbox, application } = setup();
+  let shown = 0;
+  sandbox.Services.locale = { appLocaleAsBCP47: 'en-US' };
+  application.ProgressWindow = function() {
+    this.changeHeadline = () => {};
+    this.addDescription = message => { assert.match(message, /debug log/); };
+    this.show = () => { shown++; };
+    this.startCloseTimer = () => {};
+  };
+  controller.notifyFailure();
+  assert.equal(shown, 1);
+  controller.quitting = true;
+  controller.notifyFailure(true);
+  assert.equal(shown, 1);
 });

@@ -19,6 +19,7 @@ else:
                 archive.write(file, file.relative_to(package.parent / "harness").as_posix())
 client = Client()
 try:
+    client.require_profile(ROOT / "artifacts" / "test-profile" / "profile")
     print(client.call("Addon:Install", {"path": str(package), "temporary": False}))
 finally:
     client.close()

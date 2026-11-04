@@ -6,7 +6,7 @@ Windows 上的 Zotero 托盘插件。关闭主窗口后继续在后台运行，�
 
 ## 下载和安装
 
-1. 从 [GitHub Releases](https://github.com/lisontowind/zotero-tray/releases) 下载对应版本的 `.xpi`；当前源码版本为 **0.1.3**，也可按下方命令本地构建。
+1. 从 [GitHub Releases](https://github.com/lisontowind/zotero-tray/releases) 下载已发布版本的 `.xpi`；当前源码版本为 **0.1.4**，也可按下方命令本地构建。
 2. 在 Zotero“工具 → 插件”中停用旧托盘插件。
 3. 点击插件窗口的齿轮菜单，选择“从文件安装插件”，安装下载的 `.xpi`。
 
@@ -23,20 +23,25 @@ Windows 上的 Zotero 托盘插件。关闭主窗口后继续在后台运行，�
 - 禁用或卸载时恢复隐藏窗口并清理原生资源；托盘故障时恢复窗口。
 - 异常停止等待最多 5 秒；未收到原生清理确认时保留资源，避免无限等待或强制终止回调。延迟确认到达后自动完成清理。
 - 减少空闲消息轮询和图标健康检查；右键菜单按托盘所在显示器刷新 DPI。
+- 原生清理失败时最多尝试 4 次，间隔 250 ms；成功释放的资源不重复释放，失败的资源继续保留。
+- 菜单、字体和图标按需分别更新；只切换菜单主题时复用字体与托盘图标。
+- 托盘故障时显示非阻塞通知，点击可复制诊断信息；清理持续失败时提示正常重启 Zotero。
 
 ## 文档和验证
 
 - [完整中文说明、构建与测试方法](README.zh-CN.md)
-- [v0.1.3 发布说明](docs/releases/v0.1.3.md)
-- [v0.1.3 验证记录及扫描信息](VALIDATION-0.1.3.md)
+- [v0.1.4 发布说明](docs/releases/v0.1.4.md)
+- [v0.1.4 验证记录](VALIDATION-0.1.4.md)
 - [MIT 许可证](LICENSE)
 
 ```powershell
 python scripts/build.py
-node --test tests/controller.test.cjs tests/appearance.test.cjs tests/tray-events.test.cjs
+node --test tests/controller.test.cjs tests/appearance.test.cjs tests/tray-events.test.cjs tests/worker-native.test.cjs
 python -m unittest discover -s tests -p test_package.py
 ```
 
-使用 Windows 系统 DLL 的原生接口，仍需考虑 Zotero 进程内调用的稳定性。Defender 本次扫描未发现威胁；扫描通过不保证永不误报，无需关闭防护或添加排除项。
+Windows 上可运行 `python scripts/run-windows-tests.py`，在独立配置中一键执行真实 Zotero 集成测试并正常退出测试实例。CI 同时在 Windows 和 Linux 上运行单元与打包测试；可手动选择已安装 Zotero 10 的 Windows 自托管运行器执行原生测试。
+
+使用 Windows 系统 DLL 的原生接口，仍需考虑 Zotero 进程内调用的稳定性。扫描记录见对应版本验证文档；扫描通过不保证永不误报，无需关闭防护或添加排除项。
 
 本项目为独立实现，与 Zotero 官方无隶属关系。

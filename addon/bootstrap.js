@@ -22,6 +22,9 @@ var ZoteroTray = {
   nativeBridge: null,
   lastAppearanceKey: null,
   startupTiming: null,
+  version: null,
+  lastError: null,
+  lastNotice: null,
 
   appearance() {
     const win = [...this.windows.keys()].find(win => !win.closed) || Zotero.getMainWindow();
@@ -57,6 +60,7 @@ var ZoteroTray = {
     if (!Zotero.isWin || this.worker) return;
     if (Zotero.__zoteroTrayPendingCleanup?.size) {
       this.log("Previous tray worker is still cleaning up; restart Zotero before enabling again");
+      this.notifyFailure(true);
       return;
     }
     this.startupTiming = { enteredAt: Date.now() };
@@ -70,6 +74,9 @@ var ZoteroTray = {
     this.stopTimedOut = false;
     this.nativeStopped = false;
     this.lastAppearanceKey = null;
+    this.version = data.version || null;
+    this.lastError = null;
+    this.lastNotice = null;
     try {
       // Registering a chrome URL also supports workers loaded from a packed XPI.
       const aom = Components.classes["@mozilla.org/addons/addon-manager-startup;1"]
@@ -105,14 +112,14 @@ var ZoteroTray = {
       });
       const { ctypes: c } = ChromeUtils.importESModule("resource://gre/modules/ctypes.sys.mjs");
       const user32 = c.open(system + "\\user32.dll");
-      this.nativeBridge = {
-        c, user32,
+      // Root the library before declaring functions: any declaration can throw.
+      this.nativeBridge = { c, user32, hwnd: null };
+      Object.assign(this.nativeBridge, {
         post: user32.declare("PostMessageW", c.winapi_abi, c.int32_t,
           c.voidptr_t, c.uint32_t, c.uintptr_t, c.intptr_t),
         isVisible: user32.declare("IsWindowVisible", c.winapi_abi, c.int32_t, c.voidptr_t),
-        foreground: user32.declare("SetForegroundWindow", c.winapi_abi, c.int32_t, c.voidptr_t),
-        hwnd: null
-      };
+        foreground: user32.declare("SetForegroundWindow", c.winapi_abi, c.int32_t, c.voidptr_t)
+      });
       for (const win of Zotero.getMainWindows()) this.attach(win);
     } catch (error) {
       this.fail(error);
@@ -216,7 +223,7 @@ var ZoteroTray = {
     for (const [win, state] of this.windows) {
       if (win.closed) continue;
       try {
-        const bridge = this.nativeBridge;
+        const bridge = this.nativeBridge?.isVisible && this.nativeBridge?.foreground ? this.nativeBridge : null;
         const handle = bridge ? this.windowHandle(win) : null;
         const hidden = bridge ? !bridge.isVisible(handle) : state.hidden;
         // A visible window needs activation only; reapplying visibility can
@@ -247,22 +254,68 @@ var ZoteroTray = {
 
   fail(error) {
     this.ready = false;
+    this.lastError = String(error.stack || error);
     this.log(`Tray unavailable: ${error.message}`);
     Zotero.logError(error);
     // stop() restores every hidden main window before removing the tray.
     this.stop().catch(error => Zotero.logError(error));
+    this.notifyFailure();
+  },
+
+  diagnostics() {
+    return JSON.stringify({
+      plugin: "Zotero Tray", version: this.version, zoteroVersion: Zotero.version,
+      ready: this.ready, stopping: this.stopping, cleanupPending: this.stopTimedOut,
+      startupTiming: this.startupTiming, error: this.lastError
+    }, null, 2);
+  },
+
+  notifyFailure(restart = false) {
+    if (this.quitting || this.sessionEnding) return;
+    const notice = restart ? "restart" : "unavailable";
+    if (this.lastNotice === notice || this.lastNotice === "restart") return;
+    this.lastNotice = notice;
+    try {
+      const zh = Services.locale.appLocaleAsBCP47.startsWith("zh");
+      const message = restart
+        ? (zh ? "托盘资源清理未完成，请正常重启 Zotero 后再试。" : "Tray cleanup is incomplete. Please restart Zotero normally before trying again.")
+        : (zh ? "托盘功能已暂停，关闭窗口将按 Zotero 原有方式处理。" : "The tray is unavailable. Closing windows will use Zotero's normal behavior.");
+      const diagnostics = this.diagnostics();
+      try {
+        const alerts = Components.classes["@mozilla.org/alerts-service;1"]
+          .getService(Components.interfaces.nsIAlertsService);
+        alerts.showAlertNotification(null, "Zotero Tray",
+          message + (zh ? " 点击复制诊断信息。" : " Click to copy diagnostics."), true, "",
+          { observe(subject, topic) {
+            if (topic !== "alertclickcallback") return;
+            try {
+              Components.classes["@mozilla.org/widget/clipboardhelper;1"]
+                .getService(Components.interfaces.nsIClipboardHelper).copyString(diagnostics);
+            } catch (error) { Zotero.logError(error); }
+          } }, "zotero-tray-status");
+      } catch (_) {
+        // Notifications may be unavailable. Keep the fallback non-modal.
+        const popup = new Zotero.ProgressWindow();
+        popup.changeHeadline("Zotero Tray");
+        popup.addDescription(message + (zh ? " 详细信息见 Zotero 调试日志。" : " See Zotero's debug log for details."));
+        popup.show();
+        popup.startCloseTimer(10000);
+      }
+    } catch (error) { Zotero.logError(error); }
   },
 
   deferStop(error) {
     clearTimeout(this.stopTimer);
     this.stopTimer = null;
     this.stopTimedOut = true;
+    this.lastError = String(error.stack || error);
     this.log(`Native cleanup deferred until acknowledgement or application exit: ${error.message}`);
     Zotero.logError(error);
     // Zotero removes the plugin scope on disable. Keep the controller, worker,
     // and loaded native libraries rooted in the application until a late ACK.
     this.resolveStop?.(false);
     this.resolveStop = null;
+    this.notifyFailure(true);
   },
 
   completeStop() {
